@@ -5,13 +5,15 @@ import os
 import json
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import time
+from datetime import datetime
 
 class ChromeSession:
-    def __init__(self, session_id, user_data_dir, friends_list, status_callback):
+    def __init__(self, session_id, user_data_dir, friends_list, status_callback, start_time=None):
         self.session_id = session_id
         self.user_data_dir = user_data_dir
         self.friends_list = friends_list
         self.status_callback = status_callback
+        self.start_time = start_time
         self.playwright = None
         self.browser = None
         self.page = None
@@ -61,6 +63,16 @@ class ChromeSession:
                     self.page = self.browser.pages[0]
                 else:
                     self.page = self.browser.new_page()
+                
+                # Block automatic downloads (Snapchat downloads photos automatically)
+                def handle_download(download):
+                    # Cancel the download to prevent files from being saved
+                    try:
+                        download.cancel()
+                    except:
+                        pass
+                
+                self.page.on("download", handle_download)
                     
             except Exception as e:
                 self.status_callback(self.session_id, f"Session {self.session_id}: Playwright error - {str(e)}")
@@ -77,25 +89,26 @@ class ChromeSession:
             try:
                 # Wait for camera button or main interface
                 self.page.wait_for_selector('button.FBYjn.gK0xL.W5dIq, button.fE2D5', timeout=300000)  # 5 min timeout
-                self.status_callback(self.session_id, f"Session {self.session_id}: Logged in, waiting 2 minutes for friends to load...")
+                self.status_callback(self.session_id, f"Session {self.session_id}: Logged in, waiting 3 minutes for friends to load...")
             except PlaywrightTimeoutError:
                 self.status_callback(self.session_id, f"Session {self.session_id}: Login timeout")
                 self.is_running = False
                 return
                 
-            # Wait 2 minutes for friends to load
-            time.sleep(120)
+            # Wait 3 minutes for friends to load
+            time.sleep(180)
             self.status_callback(self.session_id, f"Session {self.session_id}: Starting automation...")
                 
             # Start photo sending loop
             while self.is_running:
                 try:
                     result = self._send_photo_round()
+                    
                     if result['success']:
                         self.sent_count += result.get('sent_count', 0)
                         # Status message removed - no longer displaying "Sent X photos. Total: Y"
-                        # Wait 1 second before next round
-                        time.sleep(1.0)
+                        # Wait 2 seconds before next round
+                        time.sleep(2.0)
                     else:
                         time.sleep(0.3)  # Reduced error delay (optimized for 20 rounds/min)
                 except Exception as e:
@@ -109,229 +122,97 @@ class ChromeSession:
             
     def _send_photo_round(self):
         """Port of the JavaScript auto-photo-send logic"""
+        # Show round start time (working time)
+        if self.start_time is not None:
+            elapsed = time.time() - self.start_time
+            hours = int(elapsed // 3600)
+            minutes = int((elapsed % 3600) // 60)
+            seconds = int(elapsed % 60)
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        else:
+            time_str = "00:00:00"
+        self.status_callback(self.session_id, f"[{time_str}] Session {self.session_id}")
+        
         try:
-            # Step 0: Check if already at photo preview
-            photo_img = self._find_element_safe('img.VcjuA')
-            skip_to_send = photo_img is not None
+            # Step 1: Check if Send To button exists - if yes, skip to Send To step
+            send_to_btn_check = self._find_element_safe('button.YatIx.fGS78.eKaL7.Bnaur')
+            if not send_to_btn_check:
+                send_to_btn_check = self._find_element_safe('button.YatIx.fGS78')
+            if not send_to_btn_check:
+                send_to_btn_check = self._find_element_safe('button.YatIx')
+            skip_to_send = send_to_btn_check is not None
             
-            if not skip_to_send:
-                # Step 1: Check if already at friend selection modal
-                friend_modal_check = self._find_element_safe('form.tvul8.pebzM')
-                if friend_modal_check:
-                    # Already at friend selection modal, skip to Step 7
-                    # Step 7: Find friend list immediately (no delay - start searching right away)
-                    friend_list = self._find_element_safe('ul.s7loS')
-                    timing_list_found = time.time()
-                    
-                    if not friend_list:
-                        return {'success': False, 'error': 'Friend list not found'}
-                    
-                    # Find and click friends one at a time - optimized for speed
-                    timing_select_start = time.time()
-                    timing_list_items_found = time.time()
-                    
-                    selected_count = 0
-                    not_found_count = 0
-                    already_selected_count = 0
-                    
-                    # Click each friend using Playwright's text-based locator (more reliable)
-                    for friend_name in self.friends_list:
-                        try:
-                            clicked = False
-                            
-                            # Find by text content in the list item
-                            locator = self.page.locator('ul.s7loS li').filter(has_text=friend_name).first
-                            # Check if already selected (optimized - check and click in one JS call)
-                            result = locator.evaluate("""
-                                (el) => {
-                                    // Check if already selected
-                                    var checkedCheckbox = el.querySelector('input[type="checkbox"]:checked');
-                                    var isSelected = el.classList.contains('selected') || 
-                                                   el.getAttribute('aria-selected') === 'true' ||
-                                                   checkedCheckbox !== null;
-                                    if (!isSelected) {
-                                        // Try to click the clickable div first
-                                        var clickable = el.querySelector('div.Ewflr.cDeBk') || 
-                                                       el.querySelector('div.Ewflr') || 
-                                                       el;
-                                        clickable.click();
-                                        return true;
-                                    }
-                                    return false;
-                                }
-                            """)
-                            if result:
-                                clicked = True
-                            else:
-                                # Already selected, skip
-                                already_selected_count += 1
-                                continue
-                            
-                            if clicked:
-                                selected_count += 1
-                            else:
-                                not_found_count += 1
-                                
-                        except Exception as e:
-                            not_found_count += 1
-                            continue
-                    
-                    timing_select_end = time.time()
-                    timing_select = timing_select_end - timing_list_items_found
-                    
-                    self.status_callback(self.session_id, 
-                        f"Session {self.session_id} [TIMING] Select: {timing_select:.3f}s | "
-                        f"Clicked: {selected_count} (Skipped to Step 7)")
-                    
-                    # Step 8: Click Send button
-                    send_btn = None
-                    try:
-                        self.page.click('button.TYX6O.eKaL7.Bnaur[type="submit"]', timeout=500)
-                        send_btn = True
-                    except:
-                        try:
-                            self.page.click('button.TYX6O.eKaL7.Bnaur', timeout=500)
-                            send_btn = True
-                        except:
-                            try:
-                                self.page.click('button.TYX6O', timeout=500)
-                                send_btn = True
-                            except:
-                                pass
-                        
-                    if not send_btn:
-                        return {
-                            'success': False,
-                            'error': 'Send button not found',
-                            'selected_count': selected_count,
-                            'not_found_count': not_found_count
-                        }
-                    
-                    return {
-                        'success': True,
-                        'sent_count': selected_count,
-                        'not_found_count': not_found_count
-                    }
-                
-                # Step 2: Open camera if not already open
+            # Step 2: Friend Selection - Check if already at friend selection modal
+            friend_modal_check = self._find_element_safe('form.tvul8.pebzM')
+            skip_to_friend_selection = friend_modal_check is not None
+            
+            if not skip_to_send and not skip_to_friend_selection:
+                # Step 3: Open camera if not already open
                 camera_modal = self._find_element_safe('div.Nuu9e')
                 if not camera_modal:
-                    # Click open camera button
-                    try:
-                        self.page.click('button.FBYjn.gK0xL.W5dIq', timeout=1000)
-                    except:
-                        return {'success': False, 'error': 'Open camera button not found'}
-                    time.sleep(0.005)
+                    # Retry opening camera if modal doesn't appear
+                    camera_opened = False
+                    for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
+                        try:
+                            # Click open camera button
+                            self.page.click('button.FBYjn.gK0xL.W5dIq', timeout=200)
+                            # Wait for camera modal to appear
+                            self.page.wait_for_selector('div.Nuu9e', timeout=100, state='visible')
+                            camera_opened = True
+                            break
+                        except:
+                            # If failed, retry
+                            continue
                     
-                    # Wait for camera modal
-                    camera_modal = self._find_element_with_retry('div.Nuu9e', max_retries=4)
-                    if not camera_modal:
-                        return {'success': False, 'error': 'Camera modal did not appear'}
-                
-                # Step 3: Wait for camera to load (minimal delay)
-                time.sleep(0.002)
+                    if not camera_opened:
+                        return {'success': False, 'error': 'Camera modal did not appear after retries'}
                 
                 # Step 4: Click shot button
-                shot_button = None
-                try:
-                    self.page.click('div.Nuu9e button.fE2D5', timeout=500)
-                    shot_button = True
-                except:
+                # Retry clicking shot button if it fails
+                shot_clicked = False
+                for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
                     try:
-                        self.page.click('div.Nuu9e button.FBYjn.gK0xL.W5dIq', timeout=500)
-                        shot_button = True
+                        self.page.click('div.Nuu9e button.fE2D5', timeout=200)
+                        shot_clicked = True
+                        break
                     except:
-                        try:
-                            self.page.click('div.Nuu9e button.FBYjn', timeout=500)
-                            shot_button = True
-                        except:
-                            pass
-                    
-                if not shot_button:
-                    return {'success': False, 'error': 'Shot button not found'}
-                    
-                time.sleep(0.0005)
+                        # If failed, retry
+                        continue
                 
-                # Wait for photo to appear
-                photo_img = self._find_element_with_retry('img.VcjuA', max_retries=3)
-                if not photo_img:
-                    return {'success': False, 'error': 'Photo did not appear'}
-                    
-                time.sleep(0.0005)
+                if not shot_clicked:
+                    return {'success': False, 'error': 'Shot button not found after retries'}
             
-            # Step 5: Click Send To button (optimized for speed)
-            send_to_btn = None
-            try:
-                self.page.click('button.YatIx.fGS78.eKaL7.Bnaur', timeout=500)
-                send_to_btn = True
-            except:
-                try:
-                    self.page.click('button.YatIx.fGS78', timeout=500)
-                    send_to_btn = True
-                except:
+            # Step 5: Click Send To button (skip if already at friend modal)
+            if not skip_to_friend_selection:
+                # Retry clicking Send To button if it fails
+                send_to_clicked = False
+                for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
                     try:
-                        self.page.click('button.YatIx', timeout=500)
-                        send_to_btn = True
+                        self.page.click('button.YatIx.fGS78.eKaL7.Bnaur', timeout=200)
+                        send_to_clicked = True
+                        break
                     except:
-                        pass
+                        # If failed, retry
+                        continue
                 
-            if not send_to_btn:
-                return {'success': False, 'error': 'Send To button not found'}
+                if not send_to_clicked:
+                    return {'success': False, 'error': 'Send To button not found after retries'}
                 
-            # TIMING: Start tracking from Send To click
-            timing_start = time.time()
-            timing_after_click = time.time()
-            
-            # Step 6: Wait for friend modal (optimized - start immediately with minimal retries)
-            friend_modal = None
-            try:
-                self.page.wait_for_selector('form.tvul8.pebzM', timeout=500, state='visible')
-                friend_modal = True
-            except:
-                try:
-                    self.page.wait_for_selector('form.tvul8', timeout=500, state='visible')
-                    friend_modal = True
-                except:
-                    try:
-                        self.page.wait_for_selector('form.pebzM', timeout=500, state='visible')
-                        friend_modal = True
-                    except:
-                        pass
-            timing_modal_found = time.time()
-                
-            if not friend_modal:
-                return {'success': False, 'error': 'Friend modal not found'}
-                
-            # Step 7: Find friend list immediately (no delay - start searching right away)
-            friend_list = self._find_element_safe('ul.s7loS')
-            timing_list_found = time.time()
-                
-            if not friend_list:
-                return {'success': False, 'error': 'Friend list not found'}
-                
-            # Find and click friends one at a time - optimized for speed
-            timing_select_start = time.time()
-            timing_list_items_found = time.time()
+            # Step 6: Find and click friends one at a time - optimized for speed
             
             selected_count = 0
-            not_found_count = 0
-            already_selected_count = 0
             
             # Click each friend using Playwright's text-based locator (more reliable)
             for friend_name in self.friends_list:
                 try:
-                    clicked = False
-                    
                     # Find by text content in the list item
                     locator = self.page.locator('ul.s7loS li').filter(has_text=friend_name).first
                     # Check if already selected (optimized - check and click in one JS call)
                     result = locator.evaluate("""
                         (el) => {
-                            // Check if already selected
+                            // Check if already selected - use checkbox check (most reliable)
                             var checkedCheckbox = el.querySelector('input[type="checkbox"]:checked');
-                            var isSelected = el.classList.contains('selected') || 
-                                           el.getAttribute('aria-selected') === 'true' ||
-                                           checkedCheckbox !== null;
+                            var isSelected = checkedCheckbox !== null;
                             if (!isSelected) {
                                 // Try to click the clickable div first
                                 var clickable = el.querySelector('div.Ewflr.cDeBk') || 
@@ -344,62 +225,34 @@ class ChromeSession:
                         }
                     """)
                     if result:
-                        clicked = True
-                    else:
-                        # Already selected, skip
-                        already_selected_count += 1
-                        continue
-                    
-                    if clicked:
                         selected_count += 1
-                    else:
-                        not_found_count += 1
                         
                 except Exception as e:
-                    not_found_count += 1
                     continue
             
-            timing_select_end = time.time()
-            timing_total = timing_select_end - timing_start
-            timing_to_modal = timing_modal_found - timing_after_click
-            timing_to_list = timing_list_found - timing_modal_found
-            timing_select = timing_select_end - timing_list_items_found
+            # Step 7: Click Send button
             
-            self.status_callback(self.session_id, 
-                f"Session {self.session_id} [TIMING] Total: {timing_total:.3f}s | "
-                f"Modal: {timing_to_modal:.3f}s | "
-                f"List: {timing_to_list:.3f}s | "
-                f"Select: {timing_select:.3f}s | "
-                f"Clicked: {selected_count}")
-            
-            # Step 8: Click Send button
-            send_btn = None
-            try:
-                self.page.click('button.TYX6O.eKaL7.Bnaur[type="submit"]', timeout=500)
-                send_btn = True
-            except:
+            # Retry clicking Send button if it fails
+            send_btn_clicked = False
+            for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
                 try:
-                    self.page.click('button.TYX6O.eKaL7.Bnaur', timeout=500)
-                    send_btn = True
+                    self.page.click('button.TYX6O.eKaL7.Bnaur[type="submit"]')
+                    send_btn_clicked = True
+                    break
                 except:
-                    try:
-                        self.page.click('button.TYX6O', timeout=500)
-                        send_btn = True
-                    except:
-                        pass
-                
-            if not send_btn:
+                    # If failed, retry
+                    continue
+            
+            if not send_btn_clicked:
                 return {
                     'success': False,
-                    'error': 'Send button not found',
-                    'selected_count': selected_count,
-                    'not_found_count': not_found_count
+                    'error': 'Send button not found after retries',
+                    'selected_count': selected_count
                 }
             
             return {
                 'success': True,
-                'sent_count': selected_count,
-                'not_found_count': not_found_count
+                'sent_count': selected_count
             }
             
         except Exception as e:
@@ -679,22 +532,24 @@ class SnapchatAutomationApp:
             widget.destroy()
         self.session_widgets.clear()
         
+        # Start working time timer (set before creating sessions so they can use it)
+        self.start_time = time.time()
+        self.timer_running = True
+        
         # Launch new sessions
         for i in range(1, session_count + 1):
             user_data_dir = os.path.join(self.base_user_data_dir, f'session_{i}')
-            session = ChromeSession(i, user_data_dir, self.friends_list.copy(), self._update_status)
+            session = ChromeSession(i, user_data_dir, self.friends_list.copy(), self._update_status, self.start_time)
             self.sessions[i] = session
             session.start()
             # Create session display widget
             self._create_session_widget(i)
-            
+        
         self.launch_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self._update_status(0, f"Launched {session_count} session(s). Each will open Chrome - please login manually.")
         
-        # Start working time timer
-        self.start_time = time.time()
-        self.timer_running = True
+        # Start working time display update
         self._update_working_time()
     
     def _create_session_widget(self, session_id):
@@ -740,32 +595,29 @@ class SnapchatAutomationApp:
         self.working_time_label.config(text="")
         
     def _update_status(self, session_id, message):
-        # Calculate working time instead of timestamp
-        if self.start_time is not None:
-            elapsed = time.time() - self.start_time
-            hours = int(elapsed // 3600)
-            minutes = int((elapsed % 3600) // 60)
-            seconds = int(elapsed % 60)
-            if hours > 0:
+        # If message already has time format [HH:MM:SS] or [HH:MM], use it as is
+        if message.startswith('[') and ']' in message:
+            status_msg = f"{message}\n"
+        else:
+            # Get working time (elapsed time since start) for all messages
+            if self.start_time is not None:
+                elapsed = time.time() - self.start_time
+                hours = int(elapsed // 3600)
+                minutes = int((elapsed % 3600) // 60)
+                seconds = int(elapsed % 60)
                 time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
             else:
-                time_str = f"{minutes:02d}:{seconds:02d}"
-        else:
-            time_str = "00:00"
-        # Format: [working_time] Session X [TIMING] ... or [working_time] message
-        if session_id > 0 and "[TIMING]" in message:
-            # Message already includes "Session X", just add working time
-            status_msg = f"[{time_str}] {message}\n"
-        else:
-            # Regular message, add session prefix if session_id > 0
+                # Fallback to clock time if working time not available
+                time_str = datetime.now().strftime("%H:%M:%S")
+            
             if session_id > 0:
                 status_msg = f"[{time_str}] Session {session_id} {message}\n"
             else:
                 status_msg = f"[{time_str}] {message}\n"
         self.status_text.insert(tk.END, status_msg)
         self.status_text.see(tk.END)
-        # Update session display when status mentions sent count or Total
-        if session_id > 0 and ("Total:" in message or "Sent" in message):
+        # Update session display for active sessions
+        if session_id > 0:
             self._update_session_display(session_id)
         self.root.update_idletasks()
     
