@@ -106,10 +106,11 @@ class ChromeSession:
                     
                     if result['success']:
                         self.sent_count += result.get('sent_count', 0)
-                        # Status message removed - no longer displaying "Sent X photos. Total: Y"
-                        # Wait 2 seconds before next round
-                        time.sleep(2.0)
+                        # Wait 1 second before next round
+                        time.sleep(1.0)
                     else:
+                        error_msg = result.get('error', 'Unknown error')
+                        self.status_callback(self.session_id, f"Round failed - {error_msg}")
                         time.sleep(0.3)  # Reduced error delay (optimized for 20 rounds/min)
                 except Exception as e:
                     self.status_callback(self.session_id, f"Session {self.session_id}: Error - {str(e)}")
@@ -131,16 +132,17 @@ class ChromeSession:
             time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         else:
             time_str = "00:00:00"
-        self.status_callback(self.session_id, f"[{time_str}] Session {self.session_id}")
+        self.status_callback(self.session_id, f"Starting photo round")
         
         try:
             # Step 1: Check if Send To button exists - if yes, skip to Send To step
-            send_to_btn_check = self._find_element_safe('button.YatIx.fGS78.eKaL7.Bnaur')
-            if not send_to_btn_check:
-                send_to_btn_check = self._find_element_safe('button.YatIx.fGS78')
-            if not send_to_btn_check:
-                send_to_btn_check = self._find_element_safe('button.YatIx')
-            skip_to_send = send_to_btn_check is not None
+            # Use text-based selector (more reliable than class selectors)
+            send_to_btn_check = self.page.locator('button:has-text("Send To")').first
+            try:
+                send_to_btn_check.wait_for(state='visible', timeout=100)
+                skip_to_send = True
+            except:
+                skip_to_send = False
             
             # Step 2: Friend Selection - Check if already at friend selection modal
             friend_modal_check = self._find_element_safe('form.tvul8.pebzM')
@@ -155,7 +157,7 @@ class ChromeSession:
                     for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
                         try:
                             # Click open camera button
-                            self.page.click('button.FBYjn.gK0xL.W5dIq', timeout=200)
+                            self.page.click('button.FBYjn.gK0xL.W5dIq', timeout=500)
                             # Wait for camera modal to appear
                             self.page.wait_for_selector('div.Nuu9e', timeout=100, state='visible')
                             camera_opened = True
@@ -168,11 +170,13 @@ class ChromeSession:
                         return {'success': False, 'error': 'Camera modal did not appear after retries'}
                 
                 # Step 4: Click shot button
+                shot_button_selector = 'div.Nuu9e button.fE2D5'
+                
                 # Retry clicking shot button if it fails
                 shot_clicked = False
                 for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
                     try:
-                        self.page.click('div.Nuu9e button.fE2D5', timeout=200)
+                        self.page.click(shot_button_selector, timeout=500)
                         shot_clicked = True
                         break
                     except:
@@ -184,16 +188,33 @@ class ChromeSession:
             
             # Step 5: Click Send To button (skip if already at friend modal)
             if not skip_to_friend_selection:
-                # Retry clicking Send To button if it fails
-                send_to_clicked = False
-                for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
+                # Wait for Send To button to appear (with retries - button may take time to appear after photo)
+                send_to_locator = None
+                for wait_attempt in range(5):  # Try to find button up to 5 times
                     try:
-                        self.page.click('button.YatIx.fGS78.eKaL7.Bnaur', timeout=200)
-                        send_to_clicked = True
+                        send_to_locator = self.page.locator('button:has-text("Send To")').first
+                        send_to_locator.wait_for(state='visible', timeout=1000)
                         break
                     except:
-                        # If failed, retry
-                        continue
+                        if wait_attempt < 4:
+                            time.sleep(0.2)  # Wait a bit before retrying
+                            continue
+                        else:
+                            return {'success': False, 'error': 'Send To button not found'}
+                
+                # Retry clicking Send To button with force click (bypasses interception)
+                send_to_clicked = False
+                last_exception = None
+                for attempt in range(3):  # Try up to 3 times
+                    try:
+                        # Use force click to bypass interception issues
+                        send_to_locator.click(timeout=500, force=True)
+                        send_to_clicked = True
+                        break
+                    except Exception as e:
+                        last_exception = e
+                        if attempt < 2:
+                            time.sleep(0.1)  # Small delay before retry
                 
                 if not send_to_clicked:
                     return {'success': False, 'error': 'Send To button not found after retries'}
@@ -208,20 +229,21 @@ class ChromeSession:
                     # Find by text content in the list item
                     locator = self.page.locator('ul.s7loS li').filter(has_text=friend_name).first
                     # Check if already selected (optimized - check and click in one JS call)
+                    # DISABLED: Check removed - always click since each friend is processed only once
                     result = locator.evaluate("""
                         (el) => {
-                            // Check if already selected - use checkbox check (most reliable)
-                            var checkedCheckbox = el.querySelector('input[type="checkbox"]:checked');
-                            var isSelected = checkedCheckbox !== null;
-                            if (!isSelected) {
+                            // DISABLED: Check if already selected - use checkbox check (most reliable)
+                            // var checkedCheckbox = el.querySelector('input[type="checkbox"]:checked');
+                            // var isSelected = checkedCheckbox !== null;
+                            // if (!isSelected) {
                                 // Try to click the clickable div first
                                 var clickable = el.querySelector('div.Ewflr.cDeBk') || 
                                                el.querySelector('div.Ewflr') || 
                                                el;
                                 clickable.click();
                                 return true;
-                            }
-                            return false;
+                            // }
+                            // return false;
                         }
                     """)
                     if result:
