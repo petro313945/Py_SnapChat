@@ -30,12 +30,43 @@ class ChromeSession:
         
     def stop(self):
         self.is_running = False
+        # Stop the JavaScript automation loop
+        if self.page:
+            try:
+                self.page.evaluate("""
+                    if (window.__snapchatAutomation) {
+                        window.__snapchatAutomation.isRunning = false;
+                        if (window.__snapchatAutomation.intervalId) {
+                            clearInterval(window.__snapchatAutomation.intervalId);
+                        }
+                    }
+                    window.__snapchatAutomationRunning = false;
+                """)
+            except:
+                pass
+        # Close all pages first
+        if self.browser:
+            try:
+                # Close all pages in the browser context
+                pages_to_close = list(self.browser.pages)  # Create a copy to avoid modification during iteration
+                for page in pages_to_close:
+                    try:
+                        if not page.is_closed():
+                            page.close()
+                    except:
+                        pass
+            except:
+                pass
+        # Close the browser context (this will close all browser windows)
         if self.browser:
             try:
                 self.browser.close()
+                # Give it a moment to close
+                time.sleep(0.5)
             except:
                 pass
             self.browser = None
+        # Stop playwright
         if self.playwright:
             try:
                 self.playwright.stop()
@@ -73,6 +104,15 @@ class ChromeSession:
                         pass
                 
                 self.page.on("download", handle_download)
+                
+                # Capture console messages and forward to status
+                def handle_console(msg):
+                    text = msg.text
+                    # Forward all console messages that start with [Iteration 1]
+                    if '[Iteration 1]' in text:
+                        self.status_callback(self.session_id, f"CONSOLE: {text}")
+                
+                self.page.on("console", handle_console)
                     
             except Exception as e:
                 self.status_callback(self.session_id, f"Session {self.session_id}: Playwright error - {str(e)}")
@@ -98,22 +138,102 @@ class ChromeSession:
             # Wait 3 minutes for friends to load
             time.sleep(180)
             self.status_callback(self.session_id, f"Session {self.session_id}: Starting automation...")
+            
+            # Wait for page to be ready
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                pass  # Continue even if networkidle times out
                 
-            # Start photo sending loop
+            # Expose communication bridge for status updates (must be before script injection)
+            self.page.expose_function("reportStatus", lambda msg: self.status_callback(self.session_id, msg))
+            self.page.expose_function("reportSentCount", lambda count: self._update_sent_count(count))
+            
+            # Test console handler
+            try:
+                self.page.evaluate("console.log('[Iteration 1] Console handler test - if you see this, handler is working!')")
+                time.sleep(0.5)  # Give it time to process
+            except Exception as e:
+                self.status_callback(self.session_id, f"Session {self.session_id}: Console test error: {str(e)}")
+            
+            # Inject in-page automation script and start the loop
+            try:
+                automation_js = self._get_automation_script()
+                
+                # First inject the automation script
+                self.page.evaluate(f"""
+                    console.log('[Iteration 1] Script injection started');
+                    {automation_js}
+                """)
+                
+                # Then initialize and start the automation
+                # Calculate start_time in milliseconds for JavaScript
+                start_time_ms = int(self.start_time * 1000) if self.start_time else None
+                start_time_js = start_time_ms if start_time_ms else 'Date.now()'
+                
+                result = self.page.evaluate(f"""
+                    (function() {{
+                        try {{
+                            console.log('[Iteration 1] Initialization function started');
+                            
+                            if (window.__snapchatAutomationRunning) {{
+                                console.log('[Iteration 1] Automation already running, skipping initialization');
+                                return 'ALREADY_RUNNING';
+                            }}
+                            
+                            const friendsList = {json.dumps(self.friends_list)};
+                            console.log('[Iteration 1] Friends list loaded:', friendsList);
+                            
+                            // Initialize automation state
+                            const startTimeMs = {start_time_js};
+                            window.__snapchatAutomation = {{
+                                friendsList: friendsList,
+                                sentCount: 0,
+                                isRunning: true,
+                                intervalId: null,
+                                startTime: startTimeMs
+                            }};
+                            
+                            window.__snapchatAutomationRunning = true;
+                            
+                            // Start the main loop (it handles continuous execution internally)
+                            if (window.mainLoop) {{
+                                console.log('[Iteration 1] Starting main loop...');
+                                window.mainLoop();
+                            }} else {{
+                                console.log('[Iteration 1] ERROR: mainLoop function not found!');
+                                if (window.reportStatus) window.reportStatus('[Iteration 1] ERROR: mainLoop function not found!');
+                            }}
+                            
+                            return 'SUCCESS';
+                        }} catch (error) {{
+                            console.error('[Iteration 1] Script injection error:', error);
+                            return 'ERROR: ' + error.message;
+                        }}
+                    }})();
+                """)
+                
+                # Verify script was injected (silently)
+                time.sleep(1)
+                is_running = self.page.evaluate("window.__snapchatAutomationRunning === true")
+                has_mainloop = self.page.evaluate("typeof window.mainLoop === 'function'")
+                
+            except Exception as e:
+                self.status_callback(self.session_id, f"Session {self.session_id}: ERROR injecting script - {str(e)}")
+                import traceback
+                self.status_callback(self.session_id, f"Session {self.session_id}: Traceback: {traceback.format_exc()}")
+            
+            # Monitor the automation (Python just maintains the session)
             while self.is_running:
                 try:
-                    result = self._send_photo_round()
-                    
-                    if result['success']:
-                        self.sent_count += result.get('sent_count', 0)
-                        # Wait 1 second before next round
-                        time.sleep(1.0)
-                    else:
-                        error_msg = result.get('error', 'Unknown error')
-                        self.status_callback(self.session_id, f"Round failed - {error_msg}")
-                        time.sleep(0.3)  # Reduced error delay (optimized for 20 rounds/min)
+                    # Check if automation is still running
+                    is_automation_running = self.page.evaluate("window.__snapchatAutomationRunning === true")
+                    if not is_automation_running:
+                        self.status_callback(self.session_id, "Automation stopped in browser")
+                        break
+                    time.sleep(5)  # Check every 5 seconds
                 except Exception as e:
-                    self.status_callback(self.session_id, f"Session {self.session_id}: Error - {str(e)}")
+                    self.status_callback(self.session_id, f"Session {self.session_id}: Monitor error - {str(e)}")
                     time.sleep(5)
                     
         except Exception as e:
@@ -121,211 +241,403 @@ class ChromeSession:
         finally:
             self.is_running = False
             
-    def _send_photo_round(self):
-        """Port of the JavaScript auto-photo-send logic"""
-        # Show round start time (working time)
-        if self.start_time is not None:
-            elapsed = time.time() - self.start_time
-            hours = int(elapsed // 3600)
-            minutes = int((elapsed % 3600) // 60)
-            seconds = int(elapsed % 60)
-            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        else:
-            time_str = "00:00:00"
-        self.status_callback(self.session_id, f"Starting photo round")
-        
-        try:
-            # Step 1: Check if Send To button exists - if yes, skip to Send To step
-            # Use text-based selector (more reliable than class selectors)
-            send_to_btn_check = self.page.locator('button:has-text("Send To")').first
-            try:
-                send_to_btn_check.wait_for(state='visible', timeout=100)
-                skip_to_send = True
-            except:
-                skip_to_send = False
-            
-            # Step 2: Friend Selection - Check if already at friend selection modal
-            friend_modal_check = self._find_element_safe('form.tvul8.pebzM')
-            skip_to_friend_selection = friend_modal_check is not None
-            
-            if not skip_to_send and not skip_to_friend_selection:
-                # Step 3: Open camera if not already open
-                camera_modal = self._find_element_safe('div.Nuu9e')
-                if not camera_modal:
-                    # Retry opening camera if modal doesn't appear
-                    camera_opened = False
-                    for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
-                        try:
-                            # Click open camera button
-                            self.page.click('button.FBYjn.gK0xL.W5dIq', timeout=500)
-                            # Wait for camera modal to appear
-                            self.page.wait_for_selector('div.Nuu9e', timeout=100, state='visible')
-                            camera_opened = True
-                            break
-                        except:
-                            # If failed, retry
-                            continue
-                    
-                    if not camera_opened:
-                        return {'success': False, 'error': 'Camera modal did not appear after retries'}
-                
-                # Step 4: Click shot button
-                shot_button_selector = 'div.Nuu9e button.fE2D5'
-                
-                # Retry clicking shot button if it fails
-                shot_clicked = False
-                for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
-                    try:
-                        self.page.click(shot_button_selector, timeout=500)
-                        shot_clicked = True
-                        break
-                    except:
-                        # If failed, retry
-                        continue
-                
-                if not shot_clicked:
-                    return {'success': False, 'error': 'Shot button not found after retries'}
-            
-            # Step 5: Click Send To button (skip if already at friend modal)
-            if not skip_to_friend_selection:
-                # Wait for Send To button to appear (with retries - button may take time to appear after photo)
-                send_to_locator = None
-                for wait_attempt in range(5):  # Try to find button up to 5 times
-                    try:
-                        send_to_locator = self.page.locator('button:has-text("Send To")').first
-                        send_to_locator.wait_for(state='visible', timeout=1000)
-                        break
-                    except:
-                        if wait_attempt < 4:
-                            time.sleep(0.2)  # Wait a bit before retrying
-                            continue
-                        else:
-                            return {'success': False, 'error': 'Send To button not found'}
-                
-                # Retry clicking Send To button with force click (bypasses interception)
-                send_to_clicked = False
-                last_exception = None
-                for attempt in range(3):  # Try up to 3 times
-                    try:
-                        # Use force click to bypass interception issues
-                        send_to_locator.click(timeout=500, force=True)
-                        send_to_clicked = True
-                        break
-                    except Exception as e:
-                        last_exception = e
-                        if attempt < 2:
-                            time.sleep(0.1)  # Small delay before retry
-                
-                if not send_to_clicked:
-                    return {'success': False, 'error': 'Send To button not found after retries'}
-                
-            # Step 6: Find and click friends one at a time - optimized for speed
-            
-            selected_count = 0
-            
-            # Click each friend using Playwright's text-based locator (more reliable)
-            for friend_name in self.friends_list:
-                try:
-                    # Find by text content in the list item
-                    locator = self.page.locator('ul.s7loS li').filter(has_text=friend_name).first
-                    # Check if already selected (optimized - check and click in one JS call)
-                    # DISABLED: Check removed - always click since each friend is processed only once
-                    result = locator.evaluate("""
-                        (el) => {
-                            // DISABLED: Check if already selected - use checkbox check (most reliable)
-                            // var checkedCheckbox = el.querySelector('input[type="checkbox"]:checked');
-                            // var isSelected = checkedCheckbox !== null;
-                            // if (!isSelected) {
-                                // Try to click the clickable div first
-                                var clickable = el.querySelector('div.Ewflr.cDeBk') || 
-                                               el.querySelector('div.Ewflr') || 
-                                               el;
-                                clickable.click();
-                                return true;
-                            // }
-                            // return false;
+    def _get_automation_script(self):
+        """Returns the JavaScript automation script that runs in-page"""
+        return """
+        (function() {
+            // Helper function to find element safely
+            function findElement(selector) {
+                try {
+                    const el = document.querySelector(selector);
+                    if (el) {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return el;
                         }
-                    """)
-                    if result:
-                        selected_count += 1
-                        
-                except Exception as e:
-                    continue
-            
-            # Step 7: Click Send button
-            
-            # Retry clicking Send button if it fails
-            send_btn_clicked = False
-            for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
-                try:
-                    self.page.click('button.TYX6O.eKaL7.Bnaur[type="submit"]')
-                    send_btn_clicked = True
-                    break
-                except:
-                    # If failed, retry
-                    continue
-            
-            if not send_btn_clicked:
-                return {
-                    'success': False,
-                    'error': 'Send button not found after retries',
-                    'selected_count': selected_count
-                }
-            
-            return {
-                'success': True,
-                'sent_count': selected_count
+                    }
+                } catch (e) {}
+                return null;
             }
             
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+            // Helper function to sleep - more precise timing
+            function sleep(ms) {
+                return new Promise(resolve => {
+                    const start = Date.now();
+                    // Use setTimeout for most of the delay
+                    setTimeout(() => {
+                        // Busy-wait for the remaining time to get more precise timing
+                        const elapsed = Date.now() - start;
+                        const remaining = ms - elapsed;
+                        if (remaining > 0) {
+                            const busyStart = Date.now();
+                            // Busy-wait for remaining time (max 50ms to avoid blocking too long)
+                            while (Date.now() - busyStart < Math.min(remaining, 50)) {
+                                // Busy wait
+                            }
+                        }
+                        resolve();
+                    }, Math.max(0, ms - 10)); // Reserve 10ms for busy-wait
+                });
+            }
+            
+            // Helper function to wait for element with timeout
+            function waitForElement(selector, maxWait = 200, checkInterval = 50) {
+                return new Promise((resolve) => {
+                    const startTime = Date.now();
+                    const check = () => {
+                        const el = findElement(selector);
+                        if (el) {
+                            resolve(el);
+                        } else if ((Date.now() - startTime) >= maxWait) {
+                            resolve(null);
+                        } else {
+                            setTimeout(check, checkInterval);
+                        }
+                    };
+                    check();
+                });
+            }
+            
+            // Retry function with timeout
+            async function retryAction(action, maxRetries = 2, timeout = 200) {
+                for (let i = 0; i < maxRetries; i++) {
+                    const result = await action();
+                    if (result !== null && result !== false) {
+                        return result;
+                    }
+                    if (i < maxRetries - 1) {
+                        await sleep(timeout);
+                    }
+                }
+                return null;
+            }
+            
+            // Main round function - runs Step 1 → Step 7 in one continuous flow
+            async function runRound() {
+                if (!window.__snapchatAutomation || !window.__snapchatAutomation.isRunning) {
+                    return { success: false, error: 'Automation not running' };
+                }
+                
+                const roundStartTime = Date.now();
+                const friendsList = window.__snapchatAutomation.friendsList;
+                let roundResult = { success: false, selectedCount: 0, error: null, timings: {} };
+                
+                // Report round start with timestamp
+                if (window.reportStatus) {
+                    const elapsed = window.__snapchatAutomation.startTime ? 
+                        Math.floor((Date.now() - window.__snapchatAutomation.startTime) / 1000) : 0;
+                    const hours = Math.floor(elapsed / 3600);
+                    const minutes = Math.floor((elapsed % 3600) / 60);
+                    const seconds = elapsed % 60;
+                    const timeStr = hours > 0 ? 
+                        `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}` :
+                        `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                    window.reportStatus(`[${timeStr}] Starting new round...`);
+                }
+                
+                try {
+                    // Step 1: Check Send To Button
+                    const step1Start = Date.now();
+                    const photoImage = document.querySelector('img.VcjuA');
+                    const sendToBtn = photoImage ? document.querySelector('button.YatIx.fGS78.eKaL7.Bnaur') : null;
+                    const hasSendTo = sendToBtn !== null;
+                    roundResult.timings.step1 = Date.now() - step1Start;
+                    
+                    // Step 2: Check Friend Modal
+                    const step2Start = Date.now();
+                    const friendModal = findElement('form.tvul8.pebzM');
+                    const atFriendModal = friendModal !== null;
+                    roundResult.timings.step2 = Date.now() - step2Start;
+                    
+                    // Step 3: Open Camera (only if Steps 1 & 2 didn't skip)
+                    if (!hasSendTo && !atFriendModal) {
+                        const step3Start = Date.now();
+                        
+                        // Check if camera modal already open (use findElement to check visibility)
+                        const shotBtnCheck = findElement('button.fE2D5');
+                        if (shotBtnCheck) {
+                            roundResult.timings.step3 = Date.now() - step3Start;
+                        } else {
+                            // Click camera button with retry
+                            const cameraResult = await retryAction(async () => {
+                                const cameraBtn = findElement('button.FBYjn.gK0xL.W5dIq');
+                                if (cameraBtn) {
+                                    try {
+                                        cameraBtn.click();
+                                        return true;
+                                    } catch (e) {
+                                        return false;
+                                    }
+                                }
+                                return false;
+                            }, 2, 200);
+                            
+                            roundResult.timings.step3 = Date.now() - step3Start;
+                            if (!cameraResult) {
+                                roundResult.error = 'Step 3: Failed to open camera';
+                                if (window.reportStatus) window.reportStatus(roundResult.error);
+                                return roundResult;
+                            }
+                        }
+                    } else {
+                        roundResult.timings.step3 = 0;
+                    }
+                    
+                    // Step 4: Click Shot Button (only if Steps 1 & 2 didn't skip)
+                    if (!hasSendTo && !atFriendModal) {
+                        const step4Start = Date.now();
+                        
+                        const shotResult = await retryAction(async () => {
+                            const shotBtn = document.querySelector('button.fE2D5');
+                            if (shotBtn) {
+                                try {
+                                    // Dispatch pointer events only (pointerdown + pointerup)
+                                    shotBtn.dispatchEvent(new PointerEvent('pointerdown', {
+                                        bubbles: true,
+                                        cancelable: true,
+                                        pointerId: 1,
+                                        button: 0,
+                                        buttons: 1
+                                    }));
+                                    shotBtn.dispatchEvent(new PointerEvent('pointerup', {
+                                        bubbles: true,
+                                        cancelable: true,
+                                        pointerId: 1,
+                                        button: 0,
+                                        buttons: 0
+                                    }));
+                                    return true;
+                                } catch (e) {
+                                    return false;
+                                }
+                            }
+                            return false;
+                        }, 2, 100);
+                        
+                        roundResult.timings.step4 = Date.now() - step4Start;
+                        if (!shotResult) {
+                            roundResult.error = 'Step 4: Failed to click shot button';
+                            if (window.reportStatus) window.reportStatus(roundResult.error);
+                            return roundResult;
+                        }
+                    } else {
+                        roundResult.timings.step4 = 0;
+                    }
+                    
+                    // Step 5: Click Send To Button (only if Step 2 didn't skip)
+                    if (!atFriendModal) {
+                        const step5Start = Date.now();
+                        
+                        // Delay 300ms before starting Step 5
+                        await sleep(300);
+                        
+                        let attemptCount = 0;
+                        const sendToResult = await retryAction(async () => {
+                            attemptCount++;
+                            // TEMPORARILY DISABLED: Photo image check
+                            // const photoImg = document.querySelector('img.VcjuA');
+                            // if (!photoImg) {
+                            //     return false;
+                            // }
+                            
+                            const btn = document.querySelector('button.YatIx.fGS78.eKaL7.Bnaur');
+                            if (!btn) {
+                                return false;
+                            }
+                            
+                            // Check button visibility and properties
+                            const rect = btn.getBoundingClientRect();
+                            const isVisible = rect.width > 0 && rect.height > 0;
+                            const isDisabled = btn.disabled || btn.getAttribute('disabled') !== null;
+                            
+                            if (!isVisible) {
+                                return false;
+                            }
+                            
+                            if (isDisabled) {
+                                return false;
+                            }
+                            
+                            try {
+                                btn.click();
+                                return true;
+                            } catch (e) {
+                                return false;
+                            }
+                        }, 2, 200);
+                        
+                        roundResult.timings.step5 = Date.now() - step5Start;
+                        if (!sendToResult) {
+                            roundResult.error = 'Step 5: Failed to click Send To button';
+                            if (window.reportStatus) window.reportStatus(roundResult.error);
+                            return roundResult;
+                        }
+                    } else {
+                        roundResult.timings.step5 = 0;
+                    }
+                    
+                    // Step 6: Select Friends
+                    const step6Start = Date.now();
+                    
+                    let selectedCount = 0;
+                    const friendListItems = document.querySelectorAll('ul.s7loS li');
+                    
+                    for (const friendName of friendsList) {
+                        for (const item of friendListItems) {
+                            if (item.textContent && item.textContent.includes(friendName)) {
+                                // Temporarily disabled: Check if already selected
+                                // const checkbox = item.querySelector('input[type="checkbox"]');
+                                // const isSelected = checkbox ? checkbox.checked : false;
+                                
+                                // if (!isSelected) {
+                                    const clickable = item.querySelector('div.Ewflr.cDeBk') || 
+                                                     item.querySelector('div.Ewflr') || 
+                                                     item;
+                                    if (clickable) {
+                                        try {
+                                            clickable.click();
+                                            selectedCount++;
+                                            await sleep(5); // Small delay between clicks
+                                        } catch (e) {
+                                            // Skip on error
+                                        }
+                                    }
+                                // }
+                                break;
+                            }
+                        }
+                    }
+                    
+                    roundResult.selectedCount = selectedCount;
+                    roundResult.timings.step6 = Date.now() - step6Start;
+                    
+                    // Step 7: Click Send Button
+                    if (selectedCount > 0) {
+                        const step7Start = Date.now();
+                        
+                        const sendResult = await retryAction(async () => {
+                            const sendBtn = document.querySelector('button.TYX6O.eKaL7.Bnaur[type="submit"]');
+                            if (sendBtn) {
+                                try {
+                                    sendBtn.click();
+                                    return true;
+                                } catch (e) {
+                                    return false;
+                                }
+                            }
+                            return false;
+                        }, 2, 200);
+                        
+                        roundResult.timings.step7 = Date.now() - step7Start;
+                        if (!sendResult) {
+                            roundResult.error = 'Step 7: Failed to click Send button';
+                            if (window.reportStatus) window.reportStatus(roundResult.error);
+                            return roundResult;
+                        }
+                        
+                        window.__snapchatAutomation.sentCount += selectedCount;
+                        roundResult.success = true;
+                        roundResult.timings.total = Date.now() - roundStartTime;
+                        
+                        if (window.reportSentCount) {
+                            window.reportSentCount(window.__snapchatAutomation.sentCount);
+                        }
+                    } else {
+                        roundResult.error = 'Step 7: No friends selected';
+                        if (window.reportStatus) window.reportStatus(roundResult.error);
+                    }
+                    
+                } catch (error) {
+                    roundResult.error = 'Exception: ' + error.message;
+                    roundResult.timings.total = Date.now() - roundStartTime;
+                    if (window.reportStatus) {
+                        window.reportStatus(roundResult.error);
+                    }
+                }
+                
+                return roundResult;
+            }
+            
+            // Main continuous loop
+            async function mainLoop() {
+                let roundNumber = 0;
+                while (window.__snapchatAutomation && window.__snapchatAutomation.isRunning) {
+                    roundNumber++;
+                    const roundStartTime = Date.now();
+                    
+                    // Log round start
+                    const roundStartMsg = `[ROUND ${roundNumber}] Starting at ${new Date(roundStartTime).toISOString()}`;
+                    if (window.reportStatus) window.reportStatus(roundStartMsg);
+                    
+                    const roundResult = await runRound();
+                    const roundEndTime = Date.now();
+                    const roundDuration = roundEndTime - roundStartTime;
+                    
+                    // Log round completion
+                    const roundEndMsg = `[ROUND ${roundNumber}] Completed in ${roundDuration}ms | Success: ${roundResult.success} | Selected: ${roundResult.selectedCount} | Error: ${roundResult.error || 'none'}`;
+                    if (window.reportStatus) window.reportStatus(roundEndMsg);
+                    
+                    // Calculate delay based on result
+                    const delayCalcStart = Date.now();
+                    let delay = 2500; // Default: 2.5 seconds on success
+                    let delayReason = 'success';
+                    if (roundResult.error) {
+                        if (roundResult.error.includes('Exception')) {
+                            delay = 5000; // 5 seconds on exception
+                            delayReason = 'exception';
+                        } else {
+                            delay = 300; // 0.3 seconds on failure
+                            delayReason = 'failure';
+                        }
+                    }
+                    
+                    // Log delay calculation
+                    const delayCalcMsg = `[ROUND ${roundNumber}] Delay calculation: ${delay}ms (reason: ${delayReason}) | Calculated at ${new Date(delayCalcStart).toISOString()}`;
+                    if (window.reportStatus) window.reportStatus(delayCalcMsg);
+                    
+                    // Wait before next round - EXACT delay from round end
+                    const delayStartTime = Date.now();
+                    const delayStartMsg = `[ROUND ${roundNumber}] Delay START - waiting ${delay}ms | Started at ${new Date(delayStartTime).toISOString()}`;
+                    if (window.reportStatus) window.reportStatus(delayStartMsg);
+                    
+                    // Precise blocking delay - ensures exact pause
+                    const targetEndTime = delayStartTime + delay;
+                    await sleep(delay);
+                    
+                    // Fine-tune to exact target time
+                    let currentTime = Date.now();
+                    while (currentTime < targetEndTime) {
+                        // Busy-wait until exact target time
+                        currentTime = Date.now();
+                    }
+                    
+                    const delayEndTime = Date.now();
+                    const actualDelay = delayEndTime - delayStartTime;
+                    const delayDiff = actualDelay - delay;
+                    const delayEndMsg = `[ROUND ${roundNumber}] Delay END - waited ${actualDelay}ms (expected: ${delay}ms, diff: ${delayDiff}ms) | Ended at ${new Date(delayEndTime).toISOString()}`;
+                    if (window.reportStatus) window.reportStatus(delayEndMsg);
+                    
+                    // CRITICAL: Check if automation is still running before starting next round
+                    if (!window.__snapchatAutomation || !window.__snapchatAutomation.isRunning) {
+                        break;
+                    }
+                }
+            }
+            
+            // Start the main loop
+            if (window.__snapchatAutomation && window.__snapchatAutomation.isRunning) {
+                mainLoop();
+            }
+            
+            // Make functions available globally
+            window.runRound = runRound;
+            window.mainLoop = mainLoop;
+        })();
+        """
     
-    def _find_element_safe(self, selector):
-        try:
-            element = self.page.query_selector(selector)
-            if element:
-                # Check if element is visible using bounding_box (faster than is_visible check)
-                try:
-                    box = element.bounding_box()
-                    if box and box['width'] > 0 and box['height'] > 0:
-                        return element
-                except:
-                    pass
-            return None
-        except:
-            return None
-            
-    def _find_element_with_retry(self, selector, max_retries=3, delay=0.001):
-        # First try immediately (no delay)
-        element = self._find_element_safe(selector)
-        if element:
-            return element
-        
-        # Then retry with delays
-        for i in range(max_retries - 1):
-            time.sleep(delay)
-            element = self._find_element_safe(selector)
-            if element:
-                return element
-        return None
-        
-    def _find_element_in_container(self, container, selector):
-        try:
-            # In Playwright, container is a Locator, so we use locator.query_selector
-            if hasattr(container, 'query_selector'):
-                return container.query_selector(selector)
-            else:
-                # If container is a selector string, combine them
-                return self.page.query_selector(f'{container} {selector}')
-        except:
-            return None
-            
-    def _is_visible(self, element):
-        try:
-            box = element.bounding_box()
-            return box is not None and box['width'] > 0 and box['height'] > 0
-        except:
-            return False
+    def _update_sent_count(self, count):
+        """Update sent count from JavaScript"""
+        self.sent_count = count
 
 
 class SnapchatAutomationApp:
@@ -617,9 +929,18 @@ class SnapchatAutomationApp:
         self.working_time_label.config(text="")
         
     def _update_status(self, session_id, message):
-        # If message already has time format [HH:MM:SS] or [HH:MM], use it as is
+        # Check if message already has timestamp format [HH:MM:SS] or [HH:MM]
         if message.startswith('[') and ']' in message:
-            status_msg = f"{message}\n"
+            # Extract timestamp part and message part
+            bracket_end = message.find(']')
+            timestamp_part = message[:bracket_end + 1]
+            message_part = message[bracket_end + 1:].strip()
+            
+            # Add session prefix if needed
+            if session_id > 0:
+                status_msg = f"{timestamp_part} Session {session_id} {message_part}\n"
+            else:
+                status_msg = f"{timestamp_part} {message_part}\n"
         else:
             # Get working time (elapsed time since start) for all messages
             if self.start_time is not None:
@@ -637,6 +958,13 @@ class SnapchatAutomationApp:
             else:
                 status_msg = f"[{time_str}] {message}\n"
         self.status_text.insert(tk.END, status_msg)
+        
+        # Limit to last 30 messages
+        lines = self.status_text.get("1.0", tk.END).split('\n')
+        if len(lines) > 31:  # 30 messages + 1 empty line at end
+            # Keep only the last 30 lines
+            self.status_text.delete("1.0", f"{len(lines) - 30}.0")
+        
         self.status_text.see(tk.END)
         # Update session display for active sessions
         if session_id > 0:
